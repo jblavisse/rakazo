@@ -9,6 +9,7 @@ import type { CallToolResult, ListToolsResult } from "@modelcontextprotocol/sdk/
 import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { isLocalhostOrLoopbackIp, MCP_APP_READ_TIMEOUT_MS } from "@rakazo/contracts";
 import { cancelResponseBody } from "@rakazo/core";
+import { getLogger } from "@rakazo/logging";
 import { combineSignals } from "./connector-safety.js";
 import { MCP_APP_CLIENT_CAPABILITIES } from "./mcp-app.js";
 import { closeMcpResource } from "./mcp-close.js";
@@ -123,6 +124,8 @@ class StderrTail {
 export interface McpClientOptions {
   name?: string;
   version?: string;
+  /** The server's slug, named in the session's logs. */
+  server?: string;
   capabilities?: ConstructorParameters<typeof Client>[1];
 }
 
@@ -363,6 +366,8 @@ export class McpSession {
   private toolList?: { result: ListToolsResult; freshUntil: number };
   /** Bumped by `tools/list_changed`, so a listing already in flight is not cached. */
   private toolListVersion = 0;
+  /** Set by `tools/list_changed` until the next listing, which it explains in the logs. */
+  private toolListChanged = false;
 
   constructor(options: McpClientOptions = {}) {
     this.clientOptions = options;
@@ -377,6 +382,8 @@ export class McpSession {
     client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
       this.toolList = undefined;
       this.toolListVersion += 1;
+      this.toolListChanged = true;
+      getLogger().info("mcp tools list changed", { server: this.clientOptions.server });
     });
     return client;
   }
@@ -484,19 +491,33 @@ export class McpSession {
     }
   }
 
-  /** `refresh` skips the cached list, e.g. to check the server is still reachable. */
-  async listTools(options?: { signal?: AbortSignal; refresh?: boolean }): Promise<ListToolsResult> {
+  /** `refresh` skips the cached list and says why: a requested tool is missing from it, or a
+   * check that the server is still reachable. */
+  async listTools(options?: {
+    signal?: AbortSignal;
+    refresh?: "missing_tool" | "refresh";
+  }): Promise<ListToolsResult> {
     this.assertConnected();
     const cached = this.toolList;
     if (cached && !options?.refresh && Date.now() < cached.freshUntil) return cached.result;
+    const reason =
+      options?.refresh ?? (cached ? "expired" : this.toolListChanged ? "list_changed" : "first");
     const version = this.toolListVersion;
     const { tools, ttlMs } = await listMcpToolPages(this.client, { signal: options?.signal });
     const result = { tools };
-    if (version === this.toolListVersion)
+    if (version === this.toolListVersion) {
       this.toolList = {
         result,
         freshUntil: ttlMs === undefined ? Number.POSITIVE_INFINITY : Date.now() + ttlMs,
       };
+      this.toolListChanged = false;
+    }
+    getLogger().info("mcp tools listed", {
+      server: this.clientOptions.server,
+      reason,
+      toolCount: tools.length,
+      ttlMs,
+    });
     return result;
   }
 
