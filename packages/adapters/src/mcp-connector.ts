@@ -37,14 +37,18 @@ import {
   sanitizeConnectorError,
 } from "./connector-safety.js";
 import { credentialDigest } from "./credential-digest.js";
+import type { CatalogEntry } from "./lazy-tool-catalog.js";
 import {
   CATALOG_EXECUTE,
+  CATALOG_SEARCH,
   catalogEntries,
   DIRECT_TOOL_LIMIT,
   executeLazyCatalogControl,
   isLazyCatalogControlRoute,
   lazyCatalogTools,
+  loadCatalogEntry,
   resolveCatalogCall,
+  UnknownCatalogToolError,
 } from "./lazy-tool-catalog.js";
 import { mcpToolAppResourceUri, readMcpApp } from "./mcp-app.js";
 import { closeMcpResource } from "./mcp-close.js";
@@ -434,17 +438,35 @@ export class McpConnector implements ConnectorProvider {
     context: AdapterContext,
   ): Promise<{ call: ConnectorCall; tool: ConnectorTool } | undefined> {
     if (!call.route && call.tool.startsWith("mcp__")) {
-      return resolveCatalogCall(
-        { ...call, args: { id: call.tool, arguments: call.args } },
-        catalogEntries(await this.authorizedTools(context)),
-      );
+      const args = { id: call.tool, arguments: call.args };
+      return resolveCatalogCall({ ...call, args }, await this.catalogFor(context, args));
     }
     // Wrappers have no resourceId; real tools always do.
     if (call.route?.resourceId || call.route?.toolName !== CATALOG_EXECUTE) return undefined;
-    return resolveCatalogCall(call, catalogEntries(await this.authorizedTools(context)));
+    return resolveCatalogCall(call, await this.catalogFor(context, call.args));
   }
 
-  private async authorizedTools(context: AdapterContext): Promise<ConnectorTool[]> {
+  /** The bot's catalog. Tool lists are cached per session, so a tool the cached lists lack
+   * (added or renamed on the server since) lists every server again once before failing. */
+  private async catalogFor(
+    context: AdapterContext,
+    lookup?: Record<string, unknown>,
+  ): Promise<CatalogEntry[]> {
+    const entries = catalogEntries(await this.authorizedTools(context));
+    if (!lookup) return entries;
+    try {
+      loadCatalogEntry(entries, lookup);
+      return entries;
+    } catch (error) {
+      if (!(error instanceof UnknownCatalogToolError)) return entries;
+      return catalogEntries(await this.authorizedTools(context, true));
+    }
+  }
+
+  private async authorizedTools(
+    context: AdapterContext,
+    refresh = false,
+  ): Promise<ConnectorTool[]> {
     if (!context.botId) return [];
     const usable = { enabled: true, ...availableInSpace(context) };
     const [assigned, shared] = await Promise.all([
@@ -498,6 +520,7 @@ export class McpConnector implements ConnectorProvider {
               entry = this.sessions.get(key);
               return session.listTools({
                 signal: AbortSignal.any([context.signal, listing.signal]),
+                refresh,
               });
             }),
             this.options.discoveryTimeoutMs ?? DEFAULT_MCP_DISCOVERY_TIMEOUT_MS,
@@ -639,7 +662,10 @@ export class McpConnector implements ConnectorProvider {
       try {
         yield* executeLazyCatalogControl(
           call,
-          catalogEntries(await this.authorizedTools(context)),
+          await this.catalogFor(
+            context,
+            call.route.toolName === CATALOG_SEARCH ? undefined : call.args,
+          ),
           (resolved) => this.execute(resolved, context),
         );
       } catch (error) {
@@ -777,7 +803,7 @@ export class McpConnector implements ConnectorProvider {
               ...(material ? oauthMaterialSecrets(material) : []),
               ...(this.sessions.get(key)?.launchSecrets ?? []),
             ];
-            return session.listTools({ signal: context.signal });
+            return session.listTools({ signal: context.signal, refresh: true });
           })
         ).tools.length;
       } else {
