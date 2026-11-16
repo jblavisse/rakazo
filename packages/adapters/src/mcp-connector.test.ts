@@ -453,8 +453,9 @@ describe("MCP connector session cache", () => {
       }
       expect(events).toMatchObject([{ type: "result" }]);
       expect(state.initializations).toBe(1);
-      expect(sink.events).toHaveLength(2);
-      const log = JSON.stringify(sink.events);
+      const logged = sink.events.filter((event) => event.message !== "mcp tools listed");
+      expect(logged).toHaveLength(2);
+      const log = JSON.stringify(logged);
       expect(log).toContain("MCP secret revalidation failed");
       expect(log).not.toContain("private response value");
       expect(log).not.toContain(record.ref);
@@ -2486,7 +2487,11 @@ describe("MCP connector tool list cache", () => {
   });
 
   it("lists a session's tools once across runs, lookups and calls", async () => {
-    const state = { failNext: false, initializations: 0, calls: [] as string[] };
+    const state: Parameters<typeof mcpFetch>[0] = {
+      failNext: false,
+      initializations: 0,
+      calls: [],
+    };
     const connector = cachedConnector(state);
     try {
       await connector.discoverTools(context);
@@ -2503,7 +2508,11 @@ describe("MCP connector tool list cache", () => {
   });
 
   it("lists again once the server's ttlMs has run out", async () => {
-    const state = { failNext: false, initializations: 0, ttlMs: 1_000 };
+    const state: Parameters<typeof mcpFetch>[0] = {
+      failNext: false,
+      initializations: 0,
+      ttlMs: 1_000,
+    };
     const connector = cachedConnector(state);
     const now = vi.spyOn(Date, "now").mockReturnValue(10_000);
     try {
@@ -2520,10 +2529,10 @@ describe("MCP connector tool list cache", () => {
   });
 
   it("lists again after the server announces tools/list_changed", async () => {
-    const state = {
+    const state: Parameters<typeof mcpFetch>[0] = {
       failNext: false,
       initializations: 0,
-      calls: [] as string[],
+      calls: [],
       announceListChanged: true,
     };
     const connector = cachedConnector(state);
@@ -2563,6 +2572,77 @@ describe("MCP connector tool list cache", () => {
       expect(state.lists).toBe(3);
     } finally {
       await connector.close();
+    }
+  });
+
+  it("logs each real listing with its reason and nothing on a cache hit", async () => {
+    const sink = createTestSink();
+    const previousLogger = getLogger();
+    installLogger(createLogger({ service: "test", sinks: [sink] }));
+    const state: Parameters<typeof mcpFetch>[0] = {
+      failNext: false,
+      initializations: 0,
+      calls: [],
+      ttlMs: 1_000,
+      announceListChanged: true,
+    };
+    const connector = cachedConnector(state);
+    const now = vi.spyOn(Date, "now").mockReturnValue(10_000);
+    try {
+      await connector.discoverTools(context);
+      await connector.discoverTools(context);
+      await call(connector);
+      await connector.discoverTools(context);
+      now.mockReturnValue(12_000);
+      await connector.discoverTools(context);
+      state.tools = [
+        { name: "echo", inputSchema: { type: "object" } },
+        { name: "added", inputSchema: { type: "object" } },
+      ];
+      await connector.resolveCall({ tool: "mcp__demo__added", args: {} } as never, context);
+      expect(state.lists).toBe(4);
+      expect(
+        sink.events
+          .filter((event) => event.message.startsWith("mcp tools"))
+          .map(({ timestamp, "service.name": _, ...event }) => event),
+      ).toEqual([
+        {
+          level: "info",
+          message: "mcp tools listed",
+          server: "demo",
+          reason: "first",
+          toolCount: 1,
+          ttlMs: 1_000,
+        },
+        { level: "info", message: "mcp tools list changed", server: "demo" },
+        {
+          level: "info",
+          message: "mcp tools listed",
+          server: "demo",
+          reason: "list_changed",
+          toolCount: 1,
+          ttlMs: 1_000,
+        },
+        {
+          level: "info",
+          message: "mcp tools listed",
+          server: "demo",
+          reason: "expired",
+          toolCount: 1,
+          ttlMs: 1_000,
+        },
+        {
+          level: "info",
+          message: "mcp tools listed",
+          server: "demo",
+          reason: "missing_tool",
+          toolCount: 2,
+          ttlMs: 1_000,
+        },
+      ]);
+    } finally {
+      await connector.close();
+      installLogger(previousLogger);
     }
   });
 });

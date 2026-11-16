@@ -454,13 +454,13 @@ export class McpConnector implements ConnectorProvider {
       return entries;
     } catch (error) {
       if (!(error instanceof UnknownCatalogToolError)) return entries;
-      return catalogEntries(await this.authorizedTools(context, true));
+      return catalogEntries(await this.authorizedTools(context, "missing_tool"));
     }
   }
 
   private async authorizedTools(
     context: AdapterContext,
-    refresh = false,
+    refresh?: "missing_tool",
   ): Promise<ConnectorTool[]> {
     if (!context.botId) return [];
     const usable = { enabled: true, ...availableInSpace(context) };
@@ -800,14 +800,16 @@ export class McpConnector implements ConnectorProvider {
               ...(material ? oauthMaterialSecrets(material) : []),
               ...(this.sessions.get(key)?.launchSecrets ?? []),
             ];
-            return session.listTools({ signal: context.signal, refresh: true });
+            return session.listTools({ signal: context.signal, refresh: "refresh" });
           })
         ).tools.length;
       } else {
         const connected = await this.connectSession(server, context, () => undefined);
         secrets = [...oauthMaterialSecrets(connected.material), ...(connected.launchSecrets ?? [])];
         try {
-          toolCount = (await connected.session.listTools({ signal: context.signal })).tools.length;
+          toolCount = (
+            await connected.session.listTools({ signal: context.signal, refresh: "refresh" })
+          ).tools.length;
         } finally {
           await closeEntry(connected).catch(() => undefined);
         }
@@ -1070,7 +1072,7 @@ export class McpConnector implements ConnectorProvider {
     credentialDir?: string;
     launchSecrets?: string[];
   }> {
-    let session = new McpSession({ name: `rakazo-${server.slug}` });
+    let session = new McpSession({ name: `rakazo-${server.slug}`, server: server.slug });
     let credentialDir: string | undefined;
     const launchSecrets: string[] = [];
     // Hoisted so a throw after the secret is decoded can still hand the material out.
@@ -1283,7 +1285,7 @@ export class McpConnector implements ConnectorProvider {
           if (!authProvider || !isRejectedTokenError(error)) throw error;
           await authProvider.replaceRejectedToken();
           await closeMcpResource(() => session.close());
-          session = new McpSession({ name: `rakazo-${server.slug}` });
+          session = new McpSession({ name: `rakazo-${server.slug}`, server: server.slug });
           await connect();
         }
       }
