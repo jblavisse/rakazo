@@ -1,8 +1,10 @@
 name: carry-patch
 
 # Fork only. Rebuilds the latest upstream release with the commits CARRY_BRANCH adds on top of
-# upstream main, and publishes ghcr.io/<this repo>/app:patched-<tag> (amd64). It stops once the
-# upstream pull request opened from FIX_BRANCH is merged and released.
+# upstream main, and publishes ghcr.io/<this repo>/app:patched-<tag>-<UTC time of CARRY_BRANCH's
+# head commit> (amd64), so updating or switching CARRY_BRANCH rebuilds the current release too.
+# It stops once the upstream pull request opened from FIX_BRANCH is merged and released.
+# Repository variables CARRY_BRANCH and FIX_BRANCH override the defaults below.
 #
 # The image is built in this job and no patched branch is pushed: a release's upstream commits
 # touch .github/workflows, and the workflow token may not push those.
@@ -25,8 +27,8 @@ concurrency:
 
 env:
   UPSTREAM: elie222/rakazo
-  CARRY_BRANCH: carry/mcp-fix
-  FIX_BRANCH: fix/mcp-tool-list-cache-main
+  CARRY_BRANCH: ${{ vars.CARRY_BRANCH || 'carry/mcp-fix' }}
+  FIX_BRANCH: ${{ vars.FIX_BRANCH || 'fix/mcp-tool-list-cache-main' }}
 
 jobs:
   patch:
@@ -50,7 +52,10 @@ jobs:
           EOF
           . "$RUNNER_TEMP/issue.sh"
           tag=${TAG:-$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)}
-          image="ghcr.io/${GITHUB_REPOSITORY,,}/app:patched-$tag"
+          carried=$(gh api "repos/$GITHUB_REPOSITORY/commits/$CARRY_BRANCH" --jq .commit.committer.date)
+          stamp=${carried:0:16}
+          stamp=${stamp//[-:T]/}
+          image="ghcr.io/${GITHUB_REPOSITORY,,}/app:patched-$tag-$stamp"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "image=$image" >> "$GITHUB_OUTPUT"
           if docker manifest inspect "$image" > /dev/null 2>&1; then
