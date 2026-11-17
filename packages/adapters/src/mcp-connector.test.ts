@@ -544,7 +544,7 @@ describe("MCP connector session cache", () => {
       }
       expect(events).toMatchObject([{ type: "result" }]);
       expect(state.initializations).toBe(1);
-      expect(sink.events).toHaveLength(2);
+      expect(sink.events.filter((event) => event.message !== "mcp tools listed")).toHaveLength(2);
       const log = JSON.stringify(sink.events);
       expect(log).toContain("MCP secret revalidation failed");
       expect(log).not.toContain("private response value");
@@ -2785,6 +2785,15 @@ describe("MCP connector tool list cache", () => {
     return events;
   }
 
+  /** The reasons logged for each real listing so far; a cached list logs none. */
+  function listingReasons() {
+    const info = vi.spyOn(getLogger(), "info");
+    return () =>
+      info.mock.calls
+        .filter(([message]) => message === "mcp tools listed")
+        .map(([, fields]) => (fields as { reason: string }).reason);
+  }
+
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
@@ -2818,15 +2827,18 @@ describe("MCP connector tool list cache", () => {
       ttlMs: 1_000,
     };
     const connector = cachedConnector(state);
+    const reasons = listingReasons();
     const now = vi.spyOn(Date, "now").mockReturnValue(10_000);
     try {
       await connector.discoverTools(context);
       now.mockReturnValue(10_999);
       await connector.discoverTools(context);
       expect(state.lists).toBe(1);
+      expect(reasons()).toEqual(["first"]);
       now.mockReturnValue(11_000);
       await connector.discoverTools(context);
       expect(state.lists).toBe(2);
+      expect(reasons()).toEqual(["first", "expired"]);
     } finally {
       await connector.close();
     }
@@ -2862,6 +2874,7 @@ describe("MCP connector tool list cache", () => {
   it("lists again once the session sat idle, as a reconnect would", async () => {
     const state: Parameters<typeof mcpFetch>[0] = { failNext: false, initializations: 0 };
     const connector = cachedConnector(state);
+    const reasons = listingReasons();
     const now = vi.spyOn(Date, "now").mockReturnValue(10_000);
     try {
       await connector.discoverTools(context);
@@ -2871,6 +2884,7 @@ describe("MCP connector tool list cache", () => {
       now.mockReturnValue(10_000 + 2 * DEFAULT_MCP_STDIO_IDLE_MS);
       await connector.discoverTools(context);
       expect(state.lists).toBe(2);
+      expect(reasons()).toEqual(["first", "idle"]);
     } finally {
       await connector.close();
     }
@@ -2879,10 +2893,12 @@ describe("MCP connector tool list cache", () => {
   it("lists again when the user tests the connection", async () => {
     const state: Parameters<typeof mcpFetch>[0] = { failNext: false, initializations: 0 };
     const connector = cachedConnector(state);
+    const reasons = listingReasons();
     try {
       await connector.discoverTools(context);
       await connector.probe(SERVER as never, { spaceId: "w1", userId: "u1" });
       expect(state.lists).toBe(2);
+      expect(reasons()).toEqual(["first", "refresh"]);
     } finally {
       await connector.close();
     }
@@ -2896,6 +2912,7 @@ describe("MCP connector tool list cache", () => {
       announceListChanged: true,
     };
     const connector = cachedConnector(state);
+    const reasons = listingReasons();
     try {
       await connector.discoverTools(context);
       await call(connector);
@@ -2908,6 +2925,7 @@ describe("MCP connector tool list cache", () => {
         "mcp__demo__added",
       ]);
       expect(state.lists).toBe(2);
+      expect(reasons()).toEqual(["first", "list_changed"]);
     } finally {
       await connector.close();
     }
@@ -2916,6 +2934,7 @@ describe("MCP connector tool list cache", () => {
   it("lists again once when the cached list lacks the requested tool", async () => {
     const state: Parameters<typeof mcpFetch>[0] = { failNext: false, initializations: 0 };
     const connector = cachedConnector(state);
+    const reasons = listingReasons();
     try {
       await connector.discoverTools(context);
       state.tools = [
@@ -2947,6 +2966,7 @@ describe("MCP connector tool list cache", () => {
       expect(state.lists).toBe(4);
       await expect(execute("other-server:later")).rejects.toThrow("Tool is unknown");
       expect(state.lists).toBe(4);
+      expect(reasons()).toEqual(["first", "missing_tool", "missing_tool", "missing_tool"]);
     } finally {
       await connector.close();
     }
