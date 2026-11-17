@@ -1,0 +1,135 @@
+name: carry-patch
+
+# Fork only. Rebuilds the latest upstream release with the commits CARRY_BRANCH adds on top of
+# upstream main, and publishes ghcr.io/<this repo>/app:patched-<tag> (amd64). It stops once the
+# upstream pull request opened from FIX_BRANCH is merged and released.
+#
+# The image is built in this job and no patched branch is pushed: a release's upstream commits
+# touch .github/workflows, and the workflow token may not push those.
+on:
+  schedule:
+    - cron: "23 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream tag to patch (default the latest release)
+        required: false
+
+permissions:
+  contents: read
+  issues: write
+  packages: write
+
+concurrency:
+  group: carry-patch
+
+env:
+  UPSTREAM: elie222/rakazo
+  CARRY_BRANCH: carry/mcp-fix
+  FIX_BRANCH: fix/mcp-tool-list-cache-main
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # One issue per title, ever, so a scheduled run never repeats it.
+          cat > "$RUNNER_TEMP/issue.sh" <<'EOF'
+          issue_exists() {
+            local n
+            n=$(gh issue list -R "$GITHUB_REPOSITORY" --state all --search "\"$1\" in:title" --json title \
+              --jq "map(select(.title == \"$1\")) | length")
+            [[ $n -gt 0 ]]
+          }
+          EOF
+          . "$RUNNER_TEMP/issue.sh"
+          tag=${TAG:-$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)}
+          image="ghcr.io/${GITHUB_REPOSITORY,,}/app:patched-$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          if docker manifest inspect "$image" > /dev/null 2>&1; then
+            echo "$image already exists." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          merged=$(gh api "repos/$UPSTREAM/pulls?head=$GITHUB_REPOSITORY_OWNER:$FIX_BRANCH&state=all" \
+            --jq '[.[] | select(.merged_at) | .merge_commit_sha][0] // empty')
+          if [[ -n $merged ]]; then
+            status=$(gh api "repos/$UPSTREAM/compare/$merged...$tag" --jq .status)
+            if [[ $status == ahead || $status == identical ]]; then
+              echo "$UPSTREAM $tag contains the fix ($merged). Nothing to build." >> "$GITHUB_STEP_SUMMARY"
+              title="Upstream ships the MCP fix"
+              issue_exists "$title" || gh issue create -R "$GITHUB_REPOSITORY" --title "$title" \
+                --body "$UPSTREAM $tag contains $merged. This workflow no longer builds; it can be disabled."
+              exit 0
+            fi
+          fi
+          echo "build=true" >> "$GITHUB_OUTPUT"
+
+      - if: steps.plan.outputs.build == 'true'
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ env.CARRY_BRANCH }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - id: pick
+        if: steps.plan.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/issue.sh"
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch -q --filter=blob:none upstream main "refs/tags/$TAG:refs/tags/$TAG"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -q --detach "$TAG"
+          for c in $(git rev-list --reverse --no-merges "upstream/main..origin/$CARRY_BRANCH"); do
+            line=$(git log -1 --format='%h %s' "$c")
+            if git cherry "$TAG" "$c" "$c^" | grep -q '^-'; then
+              echo "- skipped $line (already in $TAG)" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            if ! git cherry-pick -x "$c"; then
+              files=$(git diff --name-only --diff-filter=U)
+              git cherry-pick --abort
+              title="carry-patch: conflict on $TAG"
+              # A conflict already reported for this tag waits for the next release quietly.
+              issue_exists "$title" && exit 0
+              gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$(printf \
+                '%s does not apply to %s %s.\n\nConflicting files:\n%s\n\nRebase %s onto upstream main, then run this workflow again.' \
+                "$line" "$UPSTREAM" "$TAG" "$files" "$CARRY_BRANCH")"
+              exit 1
+            fi
+            echo "- applied $line" >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - if: steps.plan.outputs.build == 'true'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - if: steps.plan.outputs.build == 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - if: steps.plan.outputs.build == 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: infra/compose/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.plan.outputs.image }}
+          build-args: GIT_SHA=${{ steps.pick.outputs.sha }}
+          cache-from: type=gha,scope=carry-app
+          cache-to: type=gha,mode=max,scope=carry-app
+          provenance: false
