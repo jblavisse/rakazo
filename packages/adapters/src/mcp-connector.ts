@@ -528,7 +528,11 @@ export class McpConnector implements ConnectorProvider {
               entry = this.sessions.get(key);
               return session.listTools({
                 signal: AbortSignal.any([context.signal, listing.signal]),
-                refresh: idle || refresh(assignment.server.slug),
+                refresh: refresh(assignment.server.slug)
+                  ? "missing_tool"
+                  : idle
+                    ? "idle"
+                    : undefined,
               });
             }),
             this.options.discoveryTimeoutMs ?? DEFAULT_MCP_DISCOVERY_TIMEOUT_MS,
@@ -813,14 +817,16 @@ export class McpConnector implements ConnectorProvider {
               ...(material ? oauthMaterialSecrets(material) : []),
               ...(this.sessions.get(key)?.launchSecrets ?? []),
             ];
-            return session.listTools({ signal: context.signal, refresh: true });
+            return session.listTools({ signal: context.signal, refresh: "refresh" });
           })
         ).tools.length;
       } else {
         const connected = await this.connectSession(server, context, () => undefined);
         secrets = [...oauthMaterialSecrets(connected.material), ...(connected.launchSecrets ?? [])];
         try {
-          toolCount = (await connected.session.listTools({ signal: context.signal })).tools.length;
+          toolCount = (
+            await connected.session.listTools({ signal: context.signal, refresh: "refresh" })
+          ).tools.length;
         } finally {
           await closeEntry(connected).catch(() => undefined);
         }
@@ -1128,7 +1134,7 @@ export class McpConnector implements ConnectorProvider {
     credentialDir?: string;
     launchSecrets?: string[];
   }> {
-    let session = new McpSession({ name: `rakazo-${server.slug}` });
+    let session = new McpSession({ name: `rakazo-${server.slug}`, server: server.slug });
     let credentialDir: string | undefined;
     const launchSecrets: string[] = [];
     // Hoisted so a throw after the secret is decoded can still hand the material out.
@@ -1345,7 +1351,7 @@ export class McpConnector implements ConnectorProvider {
           if (!authProvider || !isRejectedTokenError(error)) throw error;
           await authProvider.replaceRejectedToken();
           await closeMcpResource(() => session.close());
-          session = new McpSession({ name: `rakazo-${server.slug}` });
+          session = new McpSession({ name: `rakazo-${server.slug}`, server: server.slug });
           await connect();
         }
       }
